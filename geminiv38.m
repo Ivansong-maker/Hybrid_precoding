@@ -34,8 +34,8 @@ params.num_bits_per_symbol_target = 1e4; % Target number of bits per user per SN
 params.num_symbols_per_run = ceil(params.num_bits_per_symbol_target / params.bits_per_symbol);
 
 % --- Simulation Control ---
-params.SNR_dB_vec = 20:1:20; % SNR range in dB
-params.num_monte_carlo = 10; % Number of Monte Carlo channel realizations.  蒙特卡罗循环次数
+params.SNR_dB_vec = -20:1:20; % SNR range in dB
+params.num_monte_carlo = 10; % Number of Monte Carlo channel realizations.  蒙特卡罗循环次数初始为10
                               % BER averaging happens *inside* MC loop over symbols.
 
 % --- Precoding Scheme Selection ---
@@ -161,7 +161,7 @@ for snr_idx = 1:num_snr_points   %不同SNR
             bits_simulated_snr(scheme_idx) = bits_simulated_snr(scheme_idx) + metrics.bits_processed;
            end 
             
-           if(strcmpi(params.plot_sumrate, 'ture')) 
+           if(strcmpi(params.plot_sumrate, 'ture')) % --- R ---  计算和速率
             metrics = calculate_sumrate_metrics(H, W, noise_variance, params);
             % Accumulate results for averaging，累加求平均值
             sum_rate_acc_snr(scheme_idx) = sum_rate_acc_snr(scheme_idx) + metrics.sum_rate;
@@ -247,321 +247,9 @@ function W_norm = normalize_precoder(W_un, P_total)
          [Nt, K] = size(W_un);
          W_norm = zeros(Nt, K);
     end
+
 end
 
-% =========================================================================
-% Internal Helper Function: Calculate Sum Rate (for gradient ascent)
-% =========================================================================
-function sum_rate = calculate_sum_rate_internal(H, W, noise_variance, K)
-    % Calculates sum rate given H, normalized W, noise_variance.
-    % Simplified version of calculate_performance_metrics, only computes sum rate.
-    sum_rate = 0;
-    if any(isnan(W(:))) || any(isinf(W(:))) || isempty(W) || norm(W) < 1e-9
-        % If W is invalid (e.g., due to normalization issues), rate is 0
-        sum_rate = 0;
-        return;
-    end
-
-    H_eff = H * W; % Effective channel (K x K)
-    for k = 1:K
-        signal_power = abs(H_eff(k, k))^2;
-        interference_power = norm(H_eff(k, :))^2 - signal_power;
-        interference_power = max(0, interference_power); % Ensure non-negative
-        sinr_k = signal_power / (interference_power + noise_variance);
-        if isnan(sinr_k) || isinf(sinr_k) || sinr_k < 0 || signal_power < 1e-15
-             rate_k = 0; % Handle invalid SINR or near-zero signal
-        else
-            rate_k = log2(1 + sinr_k);
-        end
-        sum_rate = sum_rate + rate_k;
-    end
-     % Ensure sum_rate is not NaN/Inf
-     if isnan(sum_rate) || isinf(sum_rate)
-         sum_rate = 0;
-     end
-end
-% =========================================================================
-% NEW Helper Function: Optimize ("Train") Lambda for Per-User Hybrid Scheme
-% =========================================================================
-function [lambda_opt_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible] = optimize_hybrid_per_user_lambda(H, noise_variance, params)
-    % Performs multi-dimensional gradient ascent to find the optimal lambda vector.
-    % This function effectively "trains" the lambda parameters for the current channel realization.
-    % It uses numerical gradients to maximize the sum rate after overall power normalization.
-    % Inputs: H, noise_variance, params
-    % Outputs:
-    %   lambda_opt_vec: Optimized ("Trained") Kx1 lambda vector
-    %   W_mrt_un_cols: Unnormalized MRT column vectors (Nt x K)
-    %   W_zf_un_cols: Unnormalized ZF column vectors (Nt x K)
-    %   zf_col_possible: Logical vector (1 x K) indicating if ZF basis was valid
-
-    Nt = params.Nt;
-    K = params.K;
-
-    % 1. Calculate Base Precoding Matrices (Columns)
-    W_mrt_un_cols = H'; % MRT columns
-    W_zf_un_cols = zeros(Nt, K);
-    zf_col_possible = true(1, K); % Track if ZF is possible
-    try
-        HH_H = H * H'; % Calculate once
-        if cond(HH_H) > 1e10
-           warning('HybridPerUserOpt Training: H*H^H ill-conditioned (cond=%e). ZF part might be unstable.', cond(HH_H));
-           % Mark ZF as potentially unstable, but try calculating inverse
-        end
-        HH_H_inv = inv(HH_H);
-        W_zf_un_cols = H' * HH_H_inv; % Calculate all ZF columns
-    catch ME
-         warning('HybridPerUserOpt Training: Could not compute inv(H*H^H) for ZF part (%s). Disabling ZF.', ME.identifier);
-         zf_col_possible(:) = false; % Disable ZF for all columns if matrix inversion fails
-         W_zf_un_cols = zeros(Nt, K); % Ensure ZF columns are zero if unusable
-    end
-
-    % Initialization for Gradient Ascent (Lambda Training)
-    lambda_vec_k = ones(K, 1) * params.hybrid.lambda_init; % Initial lambda values
-    eta_vec = ones(K, 1) * params.hybrid.learning_rate_init; % Initial learning rates
-    grad_vec_prev = zeros(K, 1); % Previous gradient vector
-
-    % --- Optimization Loop (Training Iterations) ---
-    for iter = 1:params.hybrid.max_iterations
-        lambda_vec_prev = lambda_vec_k;
-
-        % Calculate base sum rate for current lambda_vec_k (using overall normalization)
-        W_un_k = zeros(Nt, K);
-        for i = 1:K
-            if zf_col_possible(i)
-               W_un_k(:, i) = lambda_vec_k(i) * W_mrt_un_cols(:, i) + (1 - lambda_vec_k(i)) * W_zf_un_cols(:, i);
-            else
-                W_un_k(:, i) = W_mrt_un_cols(:, i);
-                lambda_vec_k(i) = 1.0; % Ensure lambda reflects MRT usage if ZF impossible
-            end
-        end
-        W_k = normalize_precoder(W_un_k, params.total_power); % Apply overall normalization
-        rate_base = calculate_sum_rate_internal(H, W_k, noise_variance, K); % Calculate sum rate
-
-        % Calculate gradient vector numerically (Forward Difference)
-        % This estimates d(SumRate)/d(lambda_i) considering the overall normalization effect
-        grad_vec_k = zeros(K, 1);
-        delta = params.hybrid.gradient_delta;
-        for i = 1:K % Iterate through each lambda_i to estimate partial derivative
-            lambda_vec_perturbed = lambda_vec_k;
-            original_lambda_i = lambda_vec_k(i);
-            lambda_vec_perturbed(i) = min(1, original_lambda_i + delta); % Perturb lambda_i
-
-            % Skip gradient calculation if lambda cannot change or ZF is impossible for this user
-            if abs(lambda_vec_perturbed(i) - original_lambda_i) < 1e-9 || ~zf_col_possible(i)
-                grad_vec_k(i) = 0;
-                continue;
-            end
-
-            % Construct W_un with perturbed lambda_i
-            W_un_perturbed = zeros(Nt, K);
-             for j = 1:K % Reconstruct the whole unnormalized matrix
-                 if zf_col_possible(j)
-                     W_un_perturbed(:, j) = lambda_vec_perturbed(j) * W_mrt_un_cols(:, j) + (1 - lambda_vec_perturbed(j)) * W_zf_un_cols(:, j);
-                 else
-                     W_un_perturbed(:, j) = W_mrt_un_cols(:, j);
-                 end
-             end
-            W_perturbed = normalize_precoder(W_un_perturbed, params.total_power); % Normalize the perturbed matrix
-            rate_perturbed = calculate_sum_rate_internal(H, W_perturbed, noise_variance, K); % Calculate new sum rate
-
-            % Estimate gradient component
-            grad_vec_k(i) = (rate_perturbed - rate_base) / (lambda_vec_perturbed(i) - original_lambda_i);
-        end
-
-        % Update lambda vector and adapt learning rates based on gradient
-        lambda_changed = false; % Flag to check if any lambda actually changed
-        for i = 1:K
-            if ~zf_col_possible(i) % Keep lambda fixed at 1 if ZF impossible
-                lambda_vec_k(i) = 1.0;
-                continue;
-            end
-
-            % Adapt learning rate eta_i if gradient sign flips
-            if iter > 1 && grad_vec_k(i) * grad_vec_prev(i) < -1e-12 % Check for sign flip
-                eta_vec(i) = eta_vec(i) / params.hybrid.lr_reduction_factor;
-            end
-
-            % Update lambda_i using gradient ascent step
-          
-            new_lambda_i = lambda_vec_k(i) + eta_vec(i) * grad_vec_k(i);
-            new_lambda_i = max(0, min(1, new_lambda_i)); % Project lambda_i back to [0, 1]
-
-            if abs(new_lambda_i - lambda_vec_k(i)) > 1e-9 % Check if change is significant
-                lambda_changed = true;
-            end
-            lambda_vec_k(i) = new_lambda_i;
-        end
-
-        grad_vec_prev = grad_vec_k; % Store current gradient for next iteration's check
-
-        % Check convergence conditions
-        if norm(lambda_vec_k - lambda_vec_prev) < params.hybrid.convergence_threshold || ~lambda_changed
-            % fprintf('Lambda training converged at iteration %d\n', iter);
-            break; % Exit training loop if converged or no change
-        end
-
-    end % End gradient ascent loop (Training Complete)
-
-    lambda_opt_vec = lambda_vec_k; % Assign final ("trained") lambda vector
-end
-
-
-% =========================================================================
-% NEW Helper Function: Construct Hybrid Precoding Matrix from Optimized Lambdas
-% =========================================================================
-function W = apply_hybrid_per_user_precoding(lambda_opt_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible, params)
-    % Constructs the final normalized hybrid precoding matrix using optimized ("trained") lambdas.
-    % Inputs:
-    %   lambda_opt_vec: Optimized Kx1 lambda vector
-    %   W_mrt_un_cols: Unnormalized MRT column vectors (Nt x K)
-    %   W_zf_un_cols: Unnormalized ZF column vectors (Nt x K)
-    %   zf_col_possible: Logical vector (1 x K) indicating if ZF basis was valid
-    %   params: System parameters structure (for K, Nt, total_power)
-    % Output:
-    %   W: Final normalized precoding matrix (Nt x K)
-
-    Nt = params.Nt;
-    K = params.K;
-
-    % Construct final unnormalized precoder using optimized lambda vector
-    W_unnormalized = zeros(Nt, K);
-    for i = 1:K
-         if zf_col_possible(i)
-             W_unnormalized(:, i) = lambda_opt_vec(i) * W_mrt_un_cols(:, i) + (1 - lambda_opt_vec(i)) * W_zf_un_cols(:, i);
-         else
-             W_unnormalized(:, i) = W_mrt_un_cols(:, i); % Use MRT if ZF failed
-         end
-    end
-
-    % Final normalization using the helper function
-    W = normalize_precoder(W_unnormalized, params.total_power);
-end
-% =========================================================================
-% NEW Helper Function: Optimize Lambda for Per-User NORM Hybrid Scheme
-% =========================================================================
-function [lambda_opt_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible] = optimize_hybrid_per_user_norm_lambda(H, noise_variance, params)
-    % Performs multi-dimensional gradient ascent to find the optimal lambda vector
-    % for the PER-USER NORMALIZED hybrid scheme.
-    % Numerical gradients are based on sum rate calculated with per-user normalized W.
-    % Inputs: H, noise_variance, params
-    % Outputs:
-    %   lambda_opt_vec: Optimized Kx1 lambda vector
-    %   W_mrt_un_cols: Unnormalized MRT column vectors (Nt x K)
-    %   W_zf_un_cols: Unnormalized ZF column vectors (Nt x K)
-    %   zf_col_possible: Logical vector (1 x K) indicating if ZF basis was valid
-
-    Nt = params.Nt;
-    K = params.K;
-
-    % 1. Calculate Base Precoding Matrices (Columns) - Same as other hybrid
-    W_mrt_un_cols = H';
-    W_zf_un_cols = zeros(Nt, K);
-    zf_col_possible = true(1, K);
-    try
-        HH_H = H * H';
-        if cond(HH_H) > 1e10, warning('HybridPerUserNorm Training: H*H^H ill-conditioned.'); end
-        HH_H_inv = inv(HH_H);
-        W_zf_un_cols = H' * HH_H_inv;
-    catch ME
-        warning('HybridPerUserNorm Training: Could not compute inv(H*H^H) for ZF part (%s). Disabling ZF.', ME.identifier);
-        zf_col_possible(:) = false;
-        W_zf_un_cols = zeros(Nt, K);
-    end
-
-    % Initialization for Gradient Ascent
-    lambda_vec_k = ones(K, 1) * params.hybrid.lambda_init; % Use specific params
-    eta_vec = ones(K, 1) * params.hybrid.learning_rate_init;
-    grad_vec_prev = zeros(K, 1);
-
-    % --- Optimization Loop (Training Iterations) ---
-    for iter = 1:params.hybrid.max_iterations
-        lambda_vec_prev = lambda_vec_k;
-
-        % Calculate base sum rate for current lambda_vec_k using PER-USER normalization
-        W_k = apply_hybrid_per_user_norm_precoding(lambda_vec_k, W_mrt_un_cols, W_zf_un_cols, zf_col_possible, params);
-        rate_base = calculate_sum_rate_internal(H, W_k, noise_variance, K); % Rate calculation uses the final W
-
-        % Calculate gradient vector numerically (Forward Difference)
-        grad_vec_k = zeros(K, 1);
-        delta = params.hybrid.gradient_delta;
-        for i = 1:K
-            lambda_vec_perturbed = lambda_vec_k;
-            original_lambda_i = lambda_vec_k(i);
-            lambda_vec_perturbed(i) = min(1, original_lambda_i + delta);
-
-            if abs(lambda_vec_perturbed(i) - original_lambda_i) < 1e-9 || ~zf_col_possible(i)
-                grad_vec_k(i) = 0;
-                continue;
-            end
-
-            % Construct W with perturbed lambda_i using PER-USER normalization
-            W_perturbed = apply_hybrid_per_user_norm_precoding(lambda_vec_perturbed, W_mrt_un_cols, W_zf_un_cols, zf_col_possible, params);
-            rate_perturbed = calculate_sum_rate_internal(H, W_perturbed, noise_variance, K);
-
-            grad_vec_k(i) = (rate_perturbed - rate_base) / (lambda_vec_perturbed(i) - original_lambda_i);
-        end
-
-        % Update lambda vector and adapt learning rates
-        lambda_changed = false;
-        for i = 1:K
-            if ~zf_col_possible(i)
-                lambda_vec_k(i) = 1.0;
-                continue;
-            end
-            if iter > 1 && grad_vec_k(i) * grad_vec_prev(i) < -1e-12
-                eta_vec(i) = eta_vec(i) / params.hybrid.lr_reduction_factor;
-            end
-            new_lambda_i = lambda_vec_k(i) + eta_vec(i) * grad_vec_k(i);
-            new_lambda_i = max(0, min(1, new_lambda_i));
-            if abs(new_lambda_i - lambda_vec_k(i)) > 1e-9, lambda_changed = true; end
-            lambda_vec_k(i) = new_lambda_i;
-        end
-
-        grad_vec_prev = grad_vec_k;
-
-        % Check convergence
-        if norm(lambda_vec_k - lambda_vec_prev) < params.hybrid.convergence_threshold || ~lambda_changed
-            break;
-        end
-    end % End gradient ascent loop
-
-    lambda_opt_vec = lambda_vec_k;
-end
-
-
-% =========================================================================
-% NEW Helper Function: Construct Hybrid Precoding Matrix (Per-User Norm)
-% =========================================================================
-function W = apply_hybrid_per_user_norm_precoding(lambda_opt_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible, params)
-    % Constructs the final hybrid precoding matrix using PER-USER normalization.
-    % Inputs: lambda_opt_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible, params
-    % Output: W: Final precoding matrix (Nt x K), likely Tr(W*W') = K
-
-    Nt = params.Nt;
-    K = params.K;
-    W = zeros(Nt, K); % Initialize final matrix
-
-    for i = 1:K
-        % Construct the unnormalized vector for user i
-        if zf_col_possible(i)
-            w_un_i = lambda_opt_vec(i) * W_mrt_un_cols(:, i) + (1 - lambda_opt_vec(i)) * W_zf_un_cols(:, i);
-        else
-            w_un_i = W_mrt_un_cols(:, i); % Use MRT if ZF failed
-        end
-
-        % Normalize this vector independently
-        norm_wi = norm(w_un_i, 'fro'); % Use Frobenius norm for vectors
-        if norm_wi > 1e-10
-            W(:, i) = w_un_i / norm_wi; % Normalize column i to have unit norm
-        else
-            W(:, i) = zeros(Nt, 1); % Assign zero vector if norm is too small
-        end
-         % Safety check for NaN/Inf in the column
-        if any(isnan(W(:, i))) || any(isinf(W(:, i)))
-             W(:, i) = zeros(Nt, 1);
-        end
-    end
-end
 
 % =========================================================================
 % NEW Main Function for User's Hybrid Scheme (Analytic Gradient, Ind. Norm)
@@ -842,28 +530,10 @@ function [W, lambda_optimized_vec] = apply_precoding(H, noise_variance, precoder
              end
              W = normalize_precoder(W_unnormalized, params.total_power); % Normalize
 
-        case 'HYBRID_ZF_MRT' % <-- NEW CASE
-                       % 1. "Train" the lambda vector via optimization and get base precoders
-            [lambda_optimized_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible] = ...
-                optimize_hybrid_per_user_lambda(H, noise_variance, params); % Call the optimization/training function
-
-            % 2. Apply the "trained" lambdas to construct the final precoder
-            W = apply_hybrid_per_user_precoding(lambda_optimized_vec, ...
-                                                W_mrt_un_cols, W_zf_un_cols, ...
-                                                zf_col_possible, params);
-        case 'HYBRID_ZF_MRT_02' % <-- NEW CASE: Per-User Normalization Hybrid Scheme
-                    % 1. Optimize lambda vector using per-user normalization assumption
-                    [lambda_optimized_vec, W_mrt_un_cols, W_zf_un_cols, zf_col_possible] = ...
-                        optimize_hybrid_per_user_norm_lambda(H, noise_variance, params); % Uses per-user norm internally
-        
-                    % 2. Construct final W using per-user normalization
-                    W = apply_hybrid_per_user_norm_precoding(lambda_optimized_vec, ...
-                                                             W_mrt_un_cols, W_zf_un_cols, ...
-                                                             zf_col_possible, params); % Applies per-user norm
         case 'HYBRID_ZF_MRT_03' % <-- NEW CASE for user's method
             % Call the wrapper for the user's analytic gradient based method
             [lambda_optimized_vec, W] = run_hybrid_analytic_indnorm(H, noise_variance, params);
-
+            W = normalize_precoder(W, params.total_power); % Normalize
         otherwise
             error('Unknown precoder type: %s', precoder_type);
     end
